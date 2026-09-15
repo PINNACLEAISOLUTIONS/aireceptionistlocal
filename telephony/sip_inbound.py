@@ -1,8 +1,9 @@
 import os
 import json
 import base64
+import html
 import asyncio
-from fastapi import FastAPI, Request, Response, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, Request, Response
 from fastapi.responses import HTMLResponse, JSONResponse
 from database.db import init_db, get_db_connection
 from clinical.prompt import GREETING_MESSAGE
@@ -28,12 +29,84 @@ async def index():
         "endpoints": {
             "browser_call_tester": "/call",
             "telnyx_inbound_voice": "/api/telephony/telnyx/inbound",
+            "telnyx_gather_voice": "/api/telephony/telnyx/gather",
             "twilio_inbound_voice": "/api/telephony/twilio/inbound",
             "appointments_list": "/api/clinic/appointments",
             "refills_list": "/api/clinic/refills",
             "messages_list": "/api/clinic/messages"
         }
     }
+
+# --- Telnyx Inbound Webhook ---
+@app.api_route("/api/telephony/telnyx/inbound", methods=["GET", "POST"])
+async def telnyx_inbound(req: Request):
+    """
+    Telnyx TeXML Voice Response when a patient calls +1 (386) 639-0334.
+    """
+    greeting = html.escape(GREETING_MESSAGE)
+    texml = f"""<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+    <Say voice="AWS.Polly.Joanna">{greeting}</Say>
+    <Gather input="speech" timeout="5" speechTimeout="auto" action="/api/telephony/telnyx/gather" method="POST" />
+    <Say voice="AWS.Polly.Joanna">Thank you for calling High Springs Pediatrics and Primary Care. Goodbye!</Say>
+</Response>"""
+    return Response(content=texml, media_type="text/xml")
+
+# --- Telnyx Gather Speech Webhook ---
+@app.api_route("/api/telephony/telnyx/gather", methods=["GET", "POST"])
+async def telnyx_gather(req: Request):
+    """
+    Receives transcribed caller speech from Telnyx, runs Sarah's reasoning & tool execution,
+    and returns the spoken response.
+    """
+    form_data = {}
+    try:
+        form = await req.form()
+        form_data = dict(form)
+    except Exception:
+        pass
+
+    speech_result = form_data.get("SpeechResult", "").strip()
+    print(f"[Telnyx Inbound Call] Caller said: {speech_result}")
+
+    if not speech_result:
+        fallback = """<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+    <Say voice="AWS.Polly.Joanna">I did not catch that. Is there anything else I can help you with today?</Say>
+    <Gather input="speech" timeout="5" speechTimeout="auto" action="/api/telephony/telnyx/gather" method="POST" />
+    <Say voice="AWS.Polly.Joanna">Thank you for calling High Springs Pediatrics. Goodbye!</Say>
+</Response>"""
+        return Response(content=fallback, media_type="text/xml")
+
+    # Generate Sarah's clinical response
+    try:
+        agent_resp = await engine.generate_response(speech_result)
+        reply_text = html.escape(agent_resp.get("text", "Thank you for that information. How else can I assist you?"))
+    except Exception as err:
+        print(f"[Engine Error]: {err}")
+        reply_text = "Thank you for providing those details. Our clinical team at High Springs Pediatrics has noted your request. Is there anything else I can assist with?"
+
+    texml = f"""<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+    <Say voice="AWS.Polly.Joanna">{reply_text}</Say>
+    <Gather input="speech" timeout="5" speechTimeout="auto" action="/api/telephony/telnyx/gather" method="POST" />
+    <Say voice="AWS.Polly.Joanna">Thank you for calling High Springs Pediatrics. Have a wonderful day!</Say>
+</Response>"""
+    return Response(content=texml, media_type="text/xml")
+
+# --- Twilio Inbound Voice Webhook ---
+@app.post("/api/telephony/twilio/inbound")
+async def twilio_inbound(req: Request):
+    host = req.headers.get("host", "localhost:8000")
+    ws_url = f"wss://{host}/api/telephony/stream"
+    twiml = f"""<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+    <Say voice="Polly.Joanna-Neural">{html.escape(GREETING_MESSAGE)}</Say>
+    <Connect>
+        <Stream url="{ws_url}" />
+    </Connect>
+</Response>"""
+    return Response(content=twiml, media_type="text/xml")
 
 # --- Browser Audio Call Simulator ---
 @app.get("/call", response_class=HTMLResponse)
@@ -118,33 +191,6 @@ async def chat_turn(req: Request):
     user_text = data.get("text", "")
     response = await engine.generate_response(user_text)
     return response
-
-# --- Telnyx Inbound Webhook ---
-@app.post("/api/telephony/telnyx/inbound")
-async def telnyx_inbound(req: Request):
-    """
-    Telnyx TeXML Voice Response for incoming calls to +1 (386) 639-0334.
-    """
-    texml = f"""<?xml version="1.0" encoding="UTF-8"?>
-<Response>
-    <Say voice="female" language="en-US">{GREETING_MESSAGE}</Say>
-    <Gather input="speech" timeout="5" action="/api/telephony/telnyx/gather" method="POST" />
-</Response>"""
-    return Response(content=texml, media_type="application/xml")
-
-# --- Twilio Inbound Voice Webhook ---
-@app.post("/api/telephony/twilio/inbound")
-async def twilio_inbound(req: Request):
-    host = req.headers.get("host", "localhost:8000")
-    ws_url = f"wss://{host}/api/telephony/stream"
-    twiml = f"""<?xml version="1.0" encoding="UTF-8"?>
-<Response>
-    <Say voice="Polly.Joanna-Neural">{GREETING_MESSAGE}</Say>
-    <Connect>
-        <Stream url="{ws_url}" />
-    </Connect>
-</Response>"""
-    return Response(content=twiml, media_type="application/xml")
 
 # --- Live Clinic Data Endpoints ---
 @app.get("/api/clinic/appointments")
